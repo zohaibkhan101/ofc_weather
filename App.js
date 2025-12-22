@@ -1,12 +1,26 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, ActivityIndicator, StatusBar, ScrollView, RefreshControl, Dimensions } from 'react-native';
+import { StyleSheet, Text, View, ActivityIndicator, StatusBar, ScrollView, RefreshControl, Dimensions, Platform } from 'react-native';
 import * as Location from 'expo-location';
+import * as Notifications from 'expo-notifications';
+import * as TaskManager from 'expo-task-manager';
+import * as BackgroundFetch from 'expo-background-fetch';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Cloud, Sun, CloudRain, Wind, Droplets, Thermometer, MapPin, CloudLightning, CloudSnow, CloudDrizzle } from 'lucide-react-native';
 
 const { width } = Dimensions.get('window');
+const BACKGROUND_FETCH_TASK = 'background-fetch-weather';
 
-// WMO Weather interpretation codes
+// Configure Notifications Handler
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+// Helper Functions
 const getWeatherIcon = (code) => {
   if (code === undefined) return <Sun size={64} color="#FFF" />;
   if (code <= 1) return <Sun size={64} color="#FFF" />;
@@ -15,7 +29,7 @@ const getWeatherIcon = (code) => {
   if (code <= 57) return <CloudDrizzle size={64} color="#FFF" />;
   if (code <= 67) return <CloudRain size={64} color="#FFF" />;
   if (code <= 77) return <CloudSnow size={64} color="#FFF" />;
-  if (code <= 82) return <CloudRain size={64} color="#FFF" />; // Showers
+  if (code <= 82) return <CloudRain size={64} color="#FFF" />;
   if (code <= 86) return <CloudSnow size={64} color="#FFF" />;
   if (code <= 99) return <CloudLightning size={64} color="#FFF" />;
   return <Sun size={64} color="#FFF" />;
@@ -37,12 +51,54 @@ const getWeatherDescription = (code) => {
   return "Unknown";
 };
 
+// Define Background Task
+TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
+  try {
+    const location = await Location.getCurrentPositionAsync({});
+    if (!location) return BackgroundFetch.BackgroundFetchResult.NoData;
+
+    const response = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${location.coords.latitude}&longitude=${location.coords.longitude}&current=temperature_2m,weather_code&timezone=auto`
+    );
+    const data = await response.json();
+    const current = data.current;
+
+    if (current) {
+      // For local notifications, we don't need "remote" permissions, but Expo Go SDK 53 warns about Push.
+      // We process locally.
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: `${Math.round(current.temperature_2m)}° in Current Location`,
+          body: getWeatherDescription(current.weather_code),
+          sticky: true, // Android only
+          priority: Notifications.AndroidNotificationPriority.HIGH,
+        },
+        trigger: null,
+      });
+      return BackgroundFetch.BackgroundFetchResult.NewData;
+    }
+    return BackgroundFetch.BackgroundFetchResult.NoData;
+  } catch (error) {
+    console.log("Background fetch failed:", error);
+    return BackgroundFetch.BackgroundFetchResult.Failed;
+  }
+});
+
+async function registerBackgroundFetchAsync() {
+  return BackgroundFetch.registerTaskAsync(BACKGROUND_FETCH_TASK, {
+    minimumInterval: 60 * 15, // 15 minutes
+    stopOnTerminate: false, // Android only
+    startOnBoot: true, // Android only
+  });
+}
+
 export default function App() {
   const [location, setLocation] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const [weather, setWeather] = useState(null);
   const [loading, setLoading] = useState(true);
   const [address, setAddress] = useState("Locating...");
+  const [isRegistered, setIsRegistered] = useState(false);
 
   const fetchWeather = async () => {
     setLoading(true);
@@ -54,27 +110,48 @@ export default function App() {
         return;
       }
 
+      // Check for background status
+      const isTaskRegistered = await TaskManager.isTaskRegisteredAsync(BACKGROUND_FETCH_TASK);
+      setIsRegistered(isTaskRegistered);
+      if (!isTaskRegistered) {
+        await registerBackgroundFetchAsync();
+      }
+
+      // Request notification permissions
+      // Note: In Expo Go SDK 53, this may warn about Push, but is needed for local notifications too on iOS/Android 13+
+      await Notifications.requestPermissionsAsync();
+
       let location = await Location.getCurrentPositionAsync({});
       setLocation(location);
 
-      // Reverse Geocoding to get City Name
       let addresses = await Location.reverseGeocodeAsync({
         latitude: location.coords.latitude,
         longitude: location.coords.longitude
       });
-      
+
       if (addresses && addresses.length > 0) {
         const addr = addresses[0];
         setAddress(`${addr.city || addr.subregion || "Unknown"}, ${addr.region || addr.country}`);
       }
 
-      // Fetch Weather Data from Open-Meteo
       const response = await fetch(
         `https://api.open-meteo.com/v1/forecast?latitude=${location.coords.latitude}&longitude=${location.coords.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto`
       );
       const data = await response.json();
       setWeather(data);
-      
+
+      // Trigger immediate notification for demo purposes
+      const current = data.current;
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: `${Math.round(current.temperature_2m)}° in ${addresses[0]?.city || "Current Location"}`,
+          body: getWeatherDescription(current.weather_code),
+          sticky: true,
+          priority: Notifications.AndroidNotificationPriority.HIGH,
+        },
+        trigger: null,
+      });
+
     } catch (e) {
       setErrorMsg('Error fetching weather data: ' + e.message);
     } finally {
@@ -84,6 +161,14 @@ export default function App() {
 
   useEffect(() => {
     fetchWeather();
+
+    // Listen for notification interactions (e.g. tap)
+    const subscription = Notifications.addNotificationResponseReceivedListener(response => {
+      // App is opened when notification is tapped
+      console.log('Notification tapped');
+    });
+
+    return () => subscription.remove();
   }, []);
 
   const onRefresh = React.useCallback(() => {
@@ -111,10 +196,9 @@ export default function App() {
   const current = weather?.current;
   const isDay = current?.is_day === 1;
 
-  // Modern Gradient Colors based on Day/Night
-  const gradientColors = isDay 
-    ? ['#4facfe', '#00f2fe']  // Blue Cyan
-    : ['#0f2027', '#203a43', '#2c5364']; // Dark Night
+  const gradientColors = isDay
+    ? ['#4facfe', '#00f2fe']
+    : ['#0f2027', '#203a43', '#2c5364'];
 
   return (
     <View style={styles.container}>
@@ -123,11 +207,11 @@ export default function App() {
         colors={gradientColors}
         style={styles.background}
       />
-      
-      <ScrollView 
+
+      <ScrollView
         contentContainerStyle={styles.scrollContent}
         refreshControl={
-          <RefreshControl refreshing={loading} onRefresh={onRefresh} tintColor="#FFF"/>
+          <RefreshControl refreshing={loading} onRefresh={onRefresh} tintColor="#FFF" />
         }
       >
         <View style={styles.header}>
@@ -168,23 +252,23 @@ export default function App() {
         </View>
 
         {weather?.daily && (
-           <View style={styles.forecastContainer}>
-              <Text style={styles.forecastTitle}>7-Day Forecast</Text>
-              {weather.daily.time.map((day, index) => (
-                <View key={day} style={styles.forecastItem}>
-                   <Text style={styles.forecastDay}>
-                     {new Date(day).toLocaleDateString('en-US', { weekday: 'short' })}
-                   </Text>
-                   <View style={styles.forecastIcon}>
-                      {getWeatherIcon(weather.daily.weather_code[index]) && React.cloneElement(getWeatherIcon(weather.daily.weather_code[index]), { size: 24 })}
-                   </View>
-                   <View style={styles.forecastTemps}>
-                      <Text style={styles.maxTemp}>{Math.round(weather.daily.temperature_2m_max[index])}°</Text>
-                      <Text style={styles.minTemp}>{Math.round(weather.daily.temperature_2m_min[index])}°</Text>
-                   </View>
+          <View style={styles.forecastContainer}>
+            <Text style={styles.forecastTitle}>7-Day Forecast</Text>
+            {weather.daily.time.map((day, index) => (
+              <View key={day} style={styles.forecastItem}>
+                <Text style={styles.forecastDay}>
+                  {new Date(day).toLocaleDateString('en-US', { weekday: 'short' })}
+                </Text>
+                <View style={styles.forecastIcon}>
+                  {getWeatherIcon(weather.daily.weather_code[index]) && React.cloneElement(getWeatherIcon(weather.daily.weather_code[index]), { size: 24 })}
                 </View>
-              ))}
-           </View>
+                <View style={styles.forecastTemps}>
+                  <Text style={styles.maxTemp}>{Math.round(weather.daily.temperature_2m_max[index])}°</Text>
+                  <Text style={styles.minTemp}>{Math.round(weather.daily.temperature_2m_min[index])}°</Text>
+                </View>
+              </View>
+            ))}
+          </View>
         )}
 
       </ScrollView>
@@ -262,7 +346,7 @@ const styles = StyleSheet.create({
     fontSize: 80,
     fontWeight: '200',
     color: '#FFF',
-    marginLeft: 15, // Optical balancing
+    marginLeft: 15,
   },
   weatherDescription: {
     fontSize: 24,
