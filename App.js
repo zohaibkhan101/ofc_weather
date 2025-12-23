@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, ActivityIndicator, StatusBar, ScrollView, RefreshControl, Dimensions, Platform, TouchableOpacity, Modal, TextInput, Alert, FlatList } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { StyleSheet, Text, View, ActivityIndicator, StatusBar, ScrollView, RefreshControl, Dimensions, Platform, TouchableOpacity, Modal, TextInput, Alert, FlatList, AppState } from 'react-native';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
@@ -9,10 +9,9 @@ import { Cloud, Sun, CloudRain, Wind, Droplets, Thermometer, MapPin, CloudLightn
 
 const { width } = Dimensions.get('window');
 const BACKGROUND_FETCH_TASK = 'background-fetch-weather';
-// REPLACE WITH YOUR COMPUTER'S LOCAL IP ADDRESS
-const API_URL = 'http://192.168.18.12:3000'; // Change this to your actual local IP
+// UPDATED IP
+const API_URL = 'http://192.168.18.12:3000';
 
-// ... [Notification Configuration & Helpers same as before] ...
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
@@ -52,34 +51,25 @@ const getWeatherDescription = (code) => {
   return "Unknown";
 };
 
-// ... [Task Manager Definition same as before] ...
 TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
-  // ... (Keep existing implementation)
   return BackgroundFetch.BackgroundFetchResult.NoData;
 });
 
-// Culture Suggestions based on Weather
 const getPakistaniSuggestions = (weatherCode) => {
-  if (weatherCode >= 51 && weatherCode <= 67) // Rain/Drizzle
-    return ["Let's have a Pakora Party!", "Samosas & Chutney time?", "Hot Chai & Paratha?"];
-  if (weatherCode >= 95) // Thunderstorm
-    return ["Stay safe indoors with Gajar Ka Halwa!", "Hot Coffee weather?"]; // Mildly westernized but popular
-  if (weatherCode <= 1) // Clear/Hot
-    return ["Ice Cream run?", "Cold Rooh Afza?", "Sugarcane Juice (Ganne ka ras)?"];
-  if (weatherCode >= 71) // Snow (Rare but handled)
-    return ["Kashmiri Chai (Pink Tea)?", "Soup night?"];
-  return ["Biryani plans?", "BBQ tonight?", "Chai break?"]; // Default
+  if (weatherCode >= 51 && weatherCode <= 67) return ["Let's have a Pakora Party!", "Samosas & Chutney time?", "Hot Chai & Paratha?"];
+  if (weatherCode >= 95) return ["Stay safe indoors with Gajar Ka Halwa!", "Hot Coffee weather?"];
+  if (weatherCode <= 1) return ["Ice Cream run?", "Cold Rooh Afza?", "Sugarcane Juice (Ganne ka ras)?"];
+  if (weatherCode >= 71) return ["Kashmiri Chai (Pink Tea)?", "Soup night?"];
+  return ["Biryani plans?", "BBQ tonight?", "Chai break?"];
 };
 
 export default function App() {
-  // Weather State
   const [location, setLocation] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const [weather, setWeather] = useState(null);
   const [loading, setLoading] = useState(true);
   const [address, setAddress] = useState("Locating...");
 
-  // Auth & Polling State
   const [users, setUsers] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
@@ -89,12 +79,33 @@ export default function App() {
   const [pollOptions, setPollOptions] = useState(["", ""]);
   const [refreshing, setRefreshing] = useState(false);
 
-  // --- Weather Logic (Same as before) ---
+  const appState = useRef(AppState.currentState);
+
+  // --- Logging Helper ---
+  const logEvent = async (action, details = {}) => {
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (currentUser) headers['x-user-id'] = currentUser.id;
+
+      await fetch(`${API_URL}/log`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action, details })
+      });
+    } catch (e) {
+      console.log("Logging failed:", e.message); // Silent fail for UX
+    }
+  };
+
   const fetchWeather = async () => {
-    /* ... Keep existing logic ... */
     try {
       let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') { setErrorMsg('Permission denied'); setLoading(false); return; }
+      if (status !== 'granted') {
+        setErrorMsg('Permission denied');
+        setLoading(false);
+        logEvent('LOCATION_PERMISSION_DENIED');
+        return;
+      }
 
       let loc = await Location.getCurrentPositionAsync({});
       setLocation(loc);
@@ -109,10 +120,10 @@ export default function App() {
       );
       const data = await resp.json();
       setWeather(data);
+      logEvent('WEATHER_FETCHED', { lat: loc.coords.latitude, lng: loc.coords.longitude });
     } catch (e) { console.error(e); } finally { setLoading(false); }
   };
 
-  // --- Backend Logic ---
   const fetchUsers = async () => {
     try {
       const resp = await fetch(`${API_URL}/users`);
@@ -133,7 +144,8 @@ export default function App() {
   const handleLogin = (user) => {
     setCurrentUser(user);
     setShowLoginModal(false);
-    fetchPolls(); // Refresh to see my votes
+    logEvent('USER_LOGIN', { userId: user.id, name: user.name });
+    fetchPolls();
   };
 
   const handleCreatePoll = async () => {
@@ -142,11 +154,11 @@ export default function App() {
       return;
     }
 
-    // Auto-add weather context
     const weatherDesc = getWeatherDescription(weather?.current?.weather_code);
     const context = `${Math.round(weather?.current?.temperature_2m)}°C, ${weatherDesc}`;
 
     try {
+      logEvent('POLL_CREATE_SUBMIT', { question: pollQuestion });
       const resp = await fetch(`${API_URL}/polls`, {
         method: 'POST',
         headers: {
@@ -164,7 +176,7 @@ export default function App() {
         setShowPollCreateModal(false);
         setPollQuestion("");
         setPollOptions(["", ""]);
-        fetchPolls();
+        fetchPolls(); // Logger in backend records success
       } else {
         Alert.alert("Error", "Failed to create poll");
       }
@@ -175,6 +187,7 @@ export default function App() {
     if (!currentUser) { setShowLoginModal(true); return; }
 
     try {
+      logEvent('VOTE_ATTEMPT', { pollId, optionId });
       const resp = await fetch(`${API_URL}/vote`, {
         method: 'POST',
         headers: {
@@ -197,17 +210,32 @@ export default function App() {
     fetchWeather();
     fetchUsers();
     fetchPolls();
+    logEvent('APP_LAUNCHED');
+
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (appState.current.match(/inactive|background/) && nextAppState === 'active') {
+        logEvent('APP_FOREGROUNDED');
+      }
+      appState.current = nextAppState;
+    });
+
+    return () => {
+      subscription.remove();
+    };
   }, []);
 
   const onRefresh = async () => {
     setRefreshing(true);
+    logEvent('PULL_TO_REFRESH');
     await Promise.all([fetchWeather(), fetchPolls()]);
     setRefreshing(false);
   };
 
-  // --- Suggestions ---
   const suggestions = weather ? getPakistaniSuggestions(weather.current.weather_code) : [];
-  const applySuggestion = (text) => setPollQuestion(text);
+  const applySuggestion = (text) => {
+    setPollQuestion(text);
+    logEvent('SUGGESTION_SELECTED', { text });
+  };
 
   if (loading && !weather) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#00ff9f" /></View>;
 
@@ -223,7 +251,10 @@ export default function App() {
       <View style={styles.topBar}>
         <Text style={styles.appName}>PakWeather & Polls</Text>
         {currentUser ? (
-          <TouchableOpacity style={styles.userBadge} onPress={() => setCurrentUser(null)}>
+          <TouchableOpacity style={styles.userBadge} onPress={() => {
+            logEvent('USER_LOGOUT', { userId: currentUser.id });
+            setCurrentUser(null);
+          }}>
             <View style={[styles.avatarSmall, { backgroundColor: currentUser.avatar_color }]} />
             <Text style={styles.userName}>{currentUser.name}</Text>
             <LogOut size={16} color="#FFF" style={{ marginLeft: 5 }} />
@@ -240,7 +271,6 @@ export default function App() {
         contentContainerStyle={styles.scrollContent}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#FFF" />}
       >
-        {/* Weather Section (Simplified) */}
         <View style={styles.weatherSummary}>
           <View>
             <Text style={styles.locationTitle}>{address}</Text>
@@ -250,7 +280,6 @@ export default function App() {
           {getWeatherIcon(current?.weather_code)}
         </View>
 
-        {/* Create Poll Section */}
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Community Polls</Text>
           {currentUser && (
@@ -261,7 +290,6 @@ export default function App() {
           )}
         </View>
 
-        {/* Polls Feed */}
         {polls.map(poll => (
           <View key={poll.id} style={styles.pollCard}>
             <View style={styles.pollHeader}>
@@ -297,7 +325,6 @@ export default function App() {
         ))}
       </ScrollView>
 
-      {/* Login Modal */}
       <Modal visible={showLoginModal} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -319,7 +346,6 @@ export default function App() {
         </View>
       </Modal>
 
-      {/* Create Poll Modal */}
       <Modal visible={showPollCreateModal} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -368,7 +394,6 @@ export default function App() {
           </View>
         </View>
       </Modal>
-
     </View>
   );
 }
@@ -412,7 +437,6 @@ const styles = StyleSheet.create({
   voteCount: { color: '#ccc', fontSize: 12 },
   totalVotes: { color: '#666', fontSize: 12, textAlign: 'right', marginTop: 5 },
 
-  // Modals
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', padding: 20 },
   modalContent: { backgroundColor: '#1a1a1a', borderRadius: 20, padding: 20 },
   modalTitle: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
@@ -433,4 +457,3 @@ const styles = StyleSheet.create({
   actionBtnSubmit: { flex: 1, backgroundColor: '#00ff9f', padding: 15, borderRadius: 10, marginLeft: 10, alignItems: 'center' },
   actionText: { color: '#000', fontWeight: 'bold' }
 });
-

@@ -2,6 +2,7 @@ const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const { logAudit } = require('./logger'); // Import Logger
 
 const app = express();
 const PORT = 3000;
@@ -23,17 +24,15 @@ async function initPool() {
 }
 initPool();
 
-// --- Middleware: Application Level Security ---
-// In a real app, we'd verify JWTs. Here, we trust the 'x-user-id' header 
-// but enforce logic like "One Vote Per User" via DB constraints and check existence.
 const requireUser = async (req, res, next) => {
     const userId = req.headers['x-user-id'];
     if (!userId) return res.status(401).json({ error: 'Unauthorized: User ID required' });
 
     try {
-        const [rows] = await pool.query('SELECT id FROM users WHERE id = ?', [userId]);
+        const [rows] = await pool.query('SELECT id, name FROM users WHERE id = ?', [userId]);
         if (rows.length === 0) return res.status(403).json({ error: 'Forbidden: Invalid User' });
         req.userId = userId;
+        req.userName = rows[0].name; // Store name for logging
         next();
     } catch (err) {
         res.status(500).json({ error: 'Db Error' });
@@ -42,7 +41,6 @@ const requireUser = async (req, res, next) => {
 
 // --- Routes ---
 
-// Get All Users (for Login)
 app.get('/users', async (req, res) => {
     try {
         const [users] = await pool.query('SELECT * FROM users');
@@ -52,10 +50,8 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// Get Polls (Read Public)
 app.get('/polls', async (req, res) => {
     try {
-        // Fetch polls with creator info
         const query = `
       SELECT p.*, u.name as creator_name, u.avatar_color as creator_avatar 
       FROM polls p 
@@ -64,8 +60,6 @@ app.get('/polls', async (req, res) => {
     `;
         const [polls] = await pool.query(query);
 
-        // Fetch options and vote counts for each poll
-        // (N+1 query is okay for this scale, or could use complex join/aggregation)
         for (let poll of polls) {
             const [options] = await pool.query(`
         SELECT po.id, po.text, 
@@ -75,11 +69,8 @@ app.get('/polls', async (req, res) => {
       `, [poll.id]);
 
             poll.options = options;
-
-            // Calculate total votes
             poll.total_votes = options.reduce((sum, opt) => sum + opt.vote_count, 0);
 
-            // Check if current user voted (if user id provided)
             const currentUserId = req.headers['x-user-id'];
             if (currentUserId) {
                 const [myVote] = await pool.query('SELECT option_id FROM votes WHERE poll_id = ? AND user_id = ?', [poll.id, currentUserId]);
@@ -93,9 +84,12 @@ app.get('/polls', async (req, res) => {
     }
 });
 
-// Create Poll (Protected)
 app.post('/polls', requireUser, async (req, res) => {
     const { question, options, weather_context } = req.body;
+
+    // Log the attempt
+    await logAudit('POLL_CREATE_ATTEMPT', req.userId, { question }, req.userName);
+
     if (!question || !options || options.length < 2) {
         return res.status(400).json({ error: 'Invalid Poll Data' });
     }
@@ -118,16 +112,20 @@ app.post('/polls', requireUser, async (req, res) => {
         }
 
         await connection.commit();
+
+        // Log Success
+        await logAudit('POLL_CREATED', req.userId, { pollId, question, context: weather_context }, req.userName);
+
         res.json({ success: true, pollId });
     } catch (err) {
         await connection.rollback();
+        await logAudit('POLL_CREATE_ERROR', req.userId, { error: err.message }, req.userName);
         res.status(500).json({ error: err.message });
     } finally {
         connection.release();
     }
 });
 
-// Vote (Protected)
 app.post('/vote', requireUser, async (req, res) => {
     const { poll_id, option_id } = req.body;
 
@@ -136,6 +134,10 @@ app.post('/vote', requireUser, async (req, res) => {
             'INSERT INTO votes (poll_id, user_id, option_id) VALUES (?, ?, ?)',
             [poll_id, req.userId, option_id]
         );
+
+        // Log Vote
+        await logAudit('VOTE_CAST', req.userId, { poll_id, option_id }, req.userName);
+
         res.json({ success: true });
     } catch (err) {
         if (err.code === 'ER_DUP_ENTRY') {
@@ -146,7 +148,17 @@ app.post('/vote', requireUser, async (req, res) => {
     }
 });
 
-// Start Server
+// Endpoint for Frontend Usage Logs
+app.post('/log', async (req, res) => {
+    const { action, details } = req.body;
+    const userId = req.headers['x-user-id'] || null;
+    // If no user ID, try to get actor form details or default
+    const actor = userId ? `User:${userId}` : 'Anonymous';
+
+    await logAudit(action, userId, details, actor);
+    res.json({ success: true });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
 });
